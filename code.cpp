@@ -6,12 +6,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <sys/stat.h>
-#include <sys/types.h>
 using namespace std;
 
 namespace kvstore {
-static const char* DIRNAME = ".kv015";
 static const int N_BUCKETS = 16; // keep total files under limit
 
 static uint64_t fnv1a64(const string &s) {
@@ -27,16 +24,8 @@ static uint64_t fnv1a64(const string &s) {
 
 static string bucket_path(int b) {
     char buf[64];
-    snprintf(buf, sizeof(buf), "%s/bucket_%02d.bin", DIRNAME, b);
+    snprintf(buf, sizeof(buf), "bucket_%02d.bin", b);
     return string(buf);
-}
-
-static bool ensure_dir() {
-    struct stat st{};
-    if (stat(DIRNAME, &st) == 0) {
-        return S_ISDIR(st.st_mode);
-    }
-    return mkdir(DIRNAME, 0755) == 0;
 }
 
 // Binary record format per key:
@@ -65,7 +54,6 @@ static bool write_i32(FILE* f, int32_t x){ return fwrite(&x, sizeof(x), 1, f) ==
 
 static void find_values(const string& key, vector<int>& out){
     out.clear();
-    if (!ensure_dir()) return;
     uint64_t h = fnv1a64(key);
     int b = (int)(h % N_BUCKETS);
     string path = bucket_path(b);
@@ -94,7 +82,6 @@ static void find_values(const string& key, vector<int>& out){
 }
 
 static void upsert_delete(const string& key, int value, bool is_insert){
-    if (!ensure_dir()) return;
     uint64_t h = fnv1a64(key);
     int b = (int)(h % N_BUCKETS);
     string path = bucket_path(b);
