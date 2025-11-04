@@ -137,11 +137,10 @@ static void upsert_delete(const string& key, int value, bool is_insert){
                 write_u32(w.fp, cnt);
                 // copy cnt ints
                 const size_t bytes = (size_t)cnt * sizeof(int32_t);
-                const size_t BUF = 4096;
                 size_t remaining = bytes;
-                char buf[BUF];
+                char buf[4096];
                 while (remaining > 0) {
-                    size_t to_read = min(remaining, (size_t)BUF);
+                    size_t to_read = min(remaining, (size_t)sizeof(buf));
                     size_t rd = fread(buf, 1, to_read, r.fp);
                     if (rd == 0) { remaining = 0; break; }
                     fwrite(buf, 1, rd, w.fp);
