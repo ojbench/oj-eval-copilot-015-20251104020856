@@ -4,7 +4,7 @@ using namespace std;
 
 namespace kvstore {
 static const char* DIRNAME = ".kv015";
-static const int N_BUCKETS = 8; // keep total files under limit
+static const int N_BUCKETS = 16; // keep total files under limit
 
 static uint64_t fnv1a64(const string &s) {
     const uint64_t FNV_OFFSET = 1469598103934665603ull;
@@ -164,12 +164,20 @@ static void upsert_delete(const string& key, int value, bool is_insert){
     if (w.fp) { fclose(w.fp); w.fp = nullptr; }
     if (r.fp) { fclose(r.fp); r.fp = nullptr; }
     // rename
-    std::error_code ec;
-    std::filesystem::rename(tmp, path, ec);
-    if (ec) {
-        // try copy + remove
-        std::filesystem::copy_file(tmp, path, std::filesystem::copy_options::overwrite_existing, ec);
-        std::filesystem::remove(tmp, ec);
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        // fallback copy
+        FILE* rf = fopen(tmp.c_str(), "rb");
+        FILE* wf = fopen(path.c_str(), "wb");
+        if (rf && wf) {
+            char buf[4096];
+            size_t rd;
+            while ((rd = fread(buf, 1, sizeof(buf), rf)) > 0) {
+                fwrite(buf, 1, rd, wf);
+            }
+        }
+        if (wf) fclose(wf);
+        if (rf) fclose(rf);
+        std::remove(tmp.c_str());
     }
 }
 
