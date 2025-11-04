@@ -28,8 +28,8 @@ static string bucket_path(int b) {
     return string(buf);
 }
 
-// Binary record format per key:
-// [u16 key_len][key bytes][u32 count][count * i32 values sorted asc]
+// Append-only record format per operation:
+// [u16 key_len][key bytes][i32 value][u8 op] where op: 1=insert, 2=delete
 
 struct Reader {
     FILE* fp;
@@ -51,128 +51,52 @@ static bool read_i32(FILE* f, int32_t &x){ return fread(&x, sizeof(x), 1, f) == 
 static bool write_u16(FILE* f, uint16_t x){ return fwrite(&x, sizeof(x), 1, f) == 1; }
 static bool write_u32(FILE* f, uint32_t x){ return fwrite(&x, sizeof(x), 1, f) == 1; }
 static bool write_i32(FILE* f, int32_t x){ return fwrite(&x, sizeof(x), 1, f) == 1; }
+static bool read_u8(FILE* f, uint8_t &x){ return fread(&x, sizeof(x), 1, f) == 1; }
+static bool write_u8(FILE* f, uint8_t x){ return fwrite(&x, sizeof(x), 1, f) == 1; }
 
 static void find_values(const string& key, vector<int>& out){
     out.clear();
     uint64_t h = fnv1a64(key);
     int b = (int)(h % N_BUCKETS);
     string path = bucket_path(b);
-    Reader r(path);
-    if (!r.ok()) return; // no bucket yet
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return;
+    vector<pair<int,int8_t>> ops; ops.reserve(64);
     while (true) {
-        uint16_t klen;
-        if (!read_u16(r.fp, klen)) break;
+        uint16_t klen; if (!read_u16(f, klen)) break;
         string k; k.resize(klen);
-        if (klen && fread(&k[0], 1, klen, r.fp) != klen) break;
-        uint32_t cnt;
-        if (!read_u32(r.fp, cnt)) break;
-        if (k == key) {
-            out.resize(cnt);
-            for (uint32_t i = 0; i < cnt; ++i) {
-                int32_t v; if (!read_i32(r.fp, v)) { out.clear(); return; }
-                out[i] = v;
-            }
-        } else {
-            // skip values
-            const size_t to_skip = (size_t)cnt * sizeof(int32_t);
-            if (fseek(r.fp, (long)to_skip, SEEK_CUR) != 0) { break; }
-        }
+        if (klen && fread(&k[0], 1, klen, f) != klen) break;
+        int32_t v; if (!read_i32(f, v)) break;
+        uint8_t op; if (!read_u8(f, op)) break;
+        if (k == key) ops.emplace_back((int)v, (int8_t)op);
     }
-    // out already sorted in file
+    fclose(f);
+    if (ops.empty()) return;
+    stable_sort(ops.begin(), ops.end(), [](const pair<int,int8_t>& a, const pair<int,int8_t>& b){
+        return a.first < b.first;
+    });
+    out.clear(); out.reserve(ops.size());
+    for (size_t i = 0; i < ops.size(); ) {
+        size_t j = i; while (j < ops.size() && ops[j].first == ops[i].first) ++j;
+        int8_t lastop = ops[j-1].second; // stable_sort preserves input order among equals
+        if (lastop == 1) out.push_back(ops[i].first);
+        i = j;
+    }
+    // out is sorted ascending by value
 }
 
 static void upsert_delete(const string& key, int value, bool is_insert){
     uint64_t h = fnv1a64(key);
     int b = (int)(h % N_BUCKETS);
     string path = bucket_path(b);
-    string tmp = path + ".tmp";
-
-    Reader r(path);
-    Writer w(tmp);
-    if (!w.ok()) return;
-
-    bool found = false;
-    vector<int> vals;
-
-    if (r.ok()) {
-        while (true) {
-            uint16_t klen;
-            if (!read_u16(r.fp, klen)) break;
-            string k; k.resize(klen);
-            if (klen && fread(&k[0], 1, klen, r.fp) != klen) { break; }
-            uint32_t cnt;
-            if (!read_u32(r.fp, cnt)) break;
-            if (k == key) {
-                found = true;
-                vals.resize(cnt);
-                for (uint32_t i = 0; i < cnt; ++i) {
-                    int32_t v; if (!read_i32(r.fp, v)) { vals.clear(); cnt = 0; break; }
-                    vals[i] = v;
-                }
-                // modify vals
-                if (is_insert) {
-                    auto it = lower_bound(vals.begin(), vals.end(), value);
-                    if (it == vals.end() || *it != value) vals.insert(it, value);
-                } else {
-                    auto it = lower_bound(vals.begin(), vals.end(), value);
-                    if (it != vals.end() && *it == value) vals.erase(it);
-                }
-                // write back only if non-empty
-                if (!vals.empty()) {
-                    uint16_t nk = (uint16_t)key.size();
-                    write_u16(w.fp, nk);
-                    if (nk) fwrite(key.data(), 1, nk, w.fp);
-                    write_u32(w.fp, (uint32_t)vals.size());
-                    for (int v : vals) write_i32(w.fp, v);
-                }
-            } else {
-                // passthrough other keys without loading all values at once
-                write_u16(w.fp, klen);
-                if (klen) fwrite(k.data(), 1, klen, w.fp);
-                write_u32(w.fp, cnt);
-                // copy cnt ints
-                const size_t bytes = (size_t)cnt * sizeof(int32_t);
-                size_t remaining = bytes;
-                char buf[4096];
-                while (remaining > 0) {
-                    size_t to_read = min(remaining, (size_t)sizeof(buf));
-                    size_t rd = fread(buf, 1, to_read, r.fp);
-                    if (rd == 0) { remaining = 0; break; }
-                    fwrite(buf, 1, rd, w.fp);
-                    remaining -= rd;
-                }
-            }
-        }
-    }
-
-    if (!found && is_insert) {
-        // append new key
-        uint16_t nk = (uint16_t)key.size();
-        write_u16(w.fp, nk);
-        if (nk) fwrite(key.data(), 1, nk, w.fp);
-        write_u32(w.fp, 1u);
-        write_i32(w.fp, value);
-    }
-
-    // replace original file
-    if (w.fp) { fclose(w.fp); w.fp = nullptr; }
-    if (r.fp) { fclose(r.fp); r.fp = nullptr; }
-    // rename
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
-        // fallback copy
-        FILE* rf = fopen(tmp.c_str(), "rb");
-        FILE* wf = fopen(path.c_str(), "wb");
-        if (rf && wf) {
-            char buf[4096];
-            size_t rd;
-            while ((rd = fread(buf, 1, sizeof(buf), rf)) > 0) {
-                fwrite(buf, 1, rd, wf);
-            }
-        }
-        if (wf) fclose(wf);
-        if (rf) fclose(rf);
-        std::remove(tmp.c_str());
-    }
+    FILE* f = fopen(path.c_str(), "ab");
+    if (!f) return;
+    uint16_t nk = (uint16_t)key.size();
+    write_u16(f, nk);
+    if (nk) fwrite(key.data(), 1, nk, f);
+    write_i32(f, (int32_t)value);
+    write_u8(f, is_insert ? (uint8_t)1 : (uint8_t)2);
+    fclose(f);
 }
 
 } // namespace kvstore
